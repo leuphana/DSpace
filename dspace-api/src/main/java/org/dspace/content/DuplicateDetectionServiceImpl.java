@@ -7,22 +7,27 @@
  */
 package org.dspace.content;
 
-import static java.util.Comparator.comparing;
-import static java.util.Comparator.naturalOrder;
-
 import java.sql.SQLException;
 import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
 
+import jakarta.annotation.PostConstruct;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.velocity.exception.ResourceNotFoundException;
 import org.dspace.app.itemupdate.MetadataUtilities;
 import org.dspace.authorize.AuthorizeException;
 import org.dspace.authorize.service.AuthorizeService;
+import org.dspace.content.duplicatedetection.DuplicateComparison;
+import org.dspace.content.duplicatedetection.DuplicateComparisonValueTransformer;
 import org.dspace.content.service.DuplicateDetectionService;
 import org.dspace.content.service.ItemService;
 import org.dspace.content.service.MetadataFieldService;
@@ -36,7 +41,6 @@ import org.dspace.discovery.DiscoverResult;
 import org.dspace.discovery.IndexableObject;
 import org.dspace.discovery.SearchService;
 import org.dspace.discovery.SearchServiceException;
-import org.dspace.discovery.SearchUtils;
 import org.dspace.discovery.indexobject.IndexableItem;
 import org.dspace.discovery.indexobject.IndexableWorkflowItem;
 import org.dspace.discovery.indexobject.IndexableWorkspaceItem;
@@ -74,6 +78,16 @@ public class DuplicateDetectionServiceImpl implements DuplicateDetectionService 
     WorkspaceItemService workspaceItemService;
     @Autowired
     ItemService itemService;
+    @Autowired
+    SearchService searchService;
+    Map<String, DuplicateComparisonValueTransformer> duplicateComparisonValueTransformers;
+
+    @PostConstruct
+    public void init() {
+        if (duplicateComparisonValueTransformers == null) {
+            duplicateComparisonValueTransformers = new HashMap<>();
+        }
+    }
 
     /**
      * Get a list of PotentialDuplicate objects (wrappers with some metadata included for previewing) that
@@ -124,15 +138,14 @@ public class DuplicateDetectionServiceImpl implements DuplicateDetectionService 
     }
 
 
-
     /**
      * Validate an indexable object (returned by discovery search) to ensure it is permissible, readable and valid
      * and can be added to a list of results.
      * An Optional is returned, if it is empty then it was invalid or did not pass validation.
      *
-     * @param context The DSpace context
+     * @param context         The DSpace context
      * @param indexableObject The discovery search result
-     * @param original The original item (to compare IDs, submitters, etc)
+     * @param original        The original item (to compare IDs, submitters, etc)
      * @return An Optional potential duplicate
      * @throws SQLException
      * @throws AuthorizeException
@@ -243,7 +256,7 @@ public class DuplicateDetectionServiceImpl implements DuplicateDetectionService 
                     potentialDuplicate.getUuid());
         }
 
-            // By default, return an empty result
+        // By default, return an empty result
         return Optional.empty();
     }
 
@@ -252,9 +265,8 @@ public class DuplicateDetectionServiceImpl implements DuplicateDetectionService 
      * and a single-term "comparison value" constructed out of the item title
      *
      * @param context DSpace context
-     * @param item The item to check
+     * @param item    The item to check
      * @return DiscoverResult as a result of performing search. Null if invalid.
-     *
      * @throws SearchServiceException if an error was encountered during the discovery search itself.
      */
     @Override
@@ -268,22 +280,38 @@ public class DuplicateDetectionServiceImpl implements DuplicateDetectionService 
             throw new IllegalArgumentException("Cannot get duplicates for template item");
         }
 
+        // Get operator to be used combining the separate field queries (default: AND)
+        String queryOperator = configurationService.getProperty("duplicate.comparison.query.operator", "AND");
+        if (! Set.of("AND", "OR").contains(queryOperator)) {
+            throw new IllegalArgumentException(
+                "Value " + queryOperator + " not supported for property 'duplicate.comparison.query.operator'");
+        }
+
         // Build normalised comparison value
-        String comparisonValue = buildComparisonValue(context, item);
+        List<DuplicateComparison> comparisonValues = buildComparisonValue(context, item);
 
         // Construct query
-        if (StringUtils.isNotBlank(comparisonValue)) {
-            // Get search service
-            SearchService searchService = SearchUtils.getSearchService();
+        if (comparisonValues != null && !comparisonValues.isEmpty()) {
+            List<String> queryParts = new ArrayList<>();
+            Map<String, List<DuplicateComparison>> queryComparisonMap = new TreeMap<>();
+            for (DuplicateComparison comparisonValue : comparisonValues) {
+                if (!queryComparisonMap.containsKey(comparisonValue.fieldName())) {
+                    queryComparisonMap.put(comparisonValue.fieldName(), new ArrayList<>());
+                }
+                queryComparisonMap.get(comparisonValue.fieldName()).add(comparisonValue);
+            }
 
-            // Escape reserved solr characters
-            comparisonValue = searchService.escapeQueryChars(comparisonValue);
-
+            for (String fieldName : queryComparisonMap.keySet()) {
+                queryParts.add("(" + queryComparisonMap.get(fieldName).stream().map(comparisonValue ->
+                    DuplicateComparison.getSolrFieldPrefix(configurationService, comparisonValue) + ":" +
+                                searchService.escapeQueryChars(comparisonValue.value())
+                                + "~" + comparisonValue.distance()).collect(Collectors.joining(" OR ")) + ")");
+            }
+            // Combine the query parts using the defined query operator
+            String keywordQuery = StringUtils.join(queryParts.iterator(), " " + queryOperator + " ");
             // Construct discovery query based on comparison value
             DiscoverQuery discoverQuery = new DiscoverQuery();
-            discoverQuery.setQuery("(" + configurationService.getProperty("duplicate.comparison.solr.field",
-                    "deduplication_keyword") + ":" + comparisonValue + "~" +
-                    configurationService.getIntProperty("duplicate.comparison.distance", 0) + ")");
+            discoverQuery.setQuery("(" + keywordQuery + ")");
             // Add filter queries for the resource type
             discoverQuery.addFilterQueries("(search.resourcetype:Item OR " +
                     "search.resourcetype:WorkspaceItem OR " +
@@ -305,31 +333,58 @@ public class DuplicateDetectionServiceImpl implements DuplicateDetectionService 
     /**
      * Build a comparison value string made up of values of configured fields, used when indexing and querying
      * items for deduplication
+     *
      * @param context DSpace context
-     * @param item The DSpace item
+     * @param item    The DSpace item
      * @return a constructed, normalised string
      */
     @Override
-    public String buildComparisonValue(Context context, Item item) {
+    public List<DuplicateComparison> buildComparisonValue(Context context, Item item) {
         // Get configured fields to use for comparison values
         String[] comparisonFields = configurationService.getArrayProperty("duplicate.comparison.metadata.field",
-                new String[]{"dc.title"});
+                new String[] {"dc.title"});
+        int comparisonDistance = configurationService.getIntProperty("duplicate.comparison.distance", 0);
+
         // Get all values, in order, for these fields
-        StringBuilder comparisonValueBuilder = new StringBuilder();
-        String comparisonValue = null;
+        List<DuplicateComparison> comparisonValues = new ArrayList<>();
         for (String field : comparisonFields) {
             try {
                 // Get field components
-                String[] fieldParts = MetadataUtilities.parseCompoundForm(field);
+                String[] fieldDefinitions = field.split(":");
+                String fieldName = fieldDefinitions[0];
+                // use the field comparison distance if provided,
+                // otherwise use the setting from 'duplicate.comparison.distance'
+                int fieldComparisonDistance =
+                    fieldDefinitions.length > 1 ? Integer.parseInt(fieldDefinitions[1]) : comparisonDistance;
+                String[] fieldParts = MetadataUtilities.parseCompoundForm(fieldDefinitions[0]);
+
+
                 // Get all values of this field
                 List<MetadataValue> metadataValues = itemService.getMetadata(item,
                         fieldParts[0], fieldParts[1], (fieldParts.length > 2 ? fieldParts[2] : null), Item.ANY);
                 // Sort metadata values by text value, so their 'position' in db doesn't matter for dedupe purposes
-                metadataValues.sort(comparing(MetadataValue::getValue, naturalOrder()));
-                for (MetadataValue metadataValue : metadataValues) {
-                    // Add each found value to the string builder (null values interpreted as empty)
-                    if (metadataValue != null) {
-                        comparisonValueBuilder.append(metadataValue.getValue());
+                List<String> values = metadataValues.stream().map(metadataValue -> {
+                    // Apply value modification in case it's configured for the current metadata field
+                    if (duplicateComparisonValueTransformers.containsKey(field)) {
+                        return duplicateComparisonValueTransformers.get(field).transform(metadataValue.getValue());
+                    }
+                    return metadataValue.getValue();
+                }).sorted().toList();
+                for (String value : values) {
+                    // Add each found value to the string builder (null and empty values are skipped)
+                    if (StringUtils.isNotBlank(value)) {
+                        // Normalise according to configuration
+                        if (configurationService.getBooleanProperty(
+                            "duplicate.comparison.normalise.lowercase")) {
+                            value = value.toLowerCase(context.getCurrentLocale());
+                        }
+                        if (configurationService.getBooleanProperty(
+                            "duplicate.comparison.normalise.whitespace")) {
+                            value = value.replaceAll("\\s+", "");
+                        }
+                        DuplicateComparison comparisonValue =
+                            new DuplicateComparison(fieldName, value, fieldComparisonDistance);
+                        comparisonValues.add(comparisonValue);
                     }
                 }
             } catch (ParseException e) {
@@ -342,21 +397,11 @@ public class DuplicateDetectionServiceImpl implements DuplicateDetectionService 
             }
         }
 
-        // Build string
-        comparisonValue = comparisonValueBuilder.toString();
-
-        // Normalise according to configuration
-        if (!StringUtils.isBlank(comparisonValue)) {
-            if (configurationService.getBooleanProperty("duplicate.comparison.normalise.lowercase")) {
-                comparisonValue = comparisonValue.toLowerCase(context.getCurrentLocale());
-            }
-            if (configurationService.getBooleanProperty("duplicate.comparison.normalise.whitespace")) {
-                comparisonValue = comparisonValue.replaceAll("\\s+", "");
-            }
-        }
-
-        // Return comparison value
-        return comparisonValue;
+        return comparisonValues;
     }
 
+    public void setDuplicateComparisonValueTransformers(
+        Map<String, DuplicateComparisonValueTransformer> duplicateComparisonValueTransformers) {
+        this.duplicateComparisonValueTransformers = duplicateComparisonValueTransformers;
+    }
 }
